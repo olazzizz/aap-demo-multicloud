@@ -1,0 +1,168 @@
+---
+description: Preflight/healthcheck job templates that validate a demo's environment before execution, under both the primary demo label and a secondary "Preflight" label. Part of the artifact--* rule set.
+alwaysApply: true
+---
+
+# Preflight / healthcheck job templates
+
+Every `aap-demo-*` artifact ships a set of **preflight** job templates: read-only checks an
+operator runs **before** starting the demo, to catch environment problems (bad credentials,
+unreachable targets, a down dependency) before they surface mid-demo in front of a customer.
+
+## Check categories are demo-specific, not a fixed checklist
+
+There is **no single mandatory list of checks** that applies to every demo — each artifact has
+its own dependencies (cloud providers, target hosts, third-party APIs, custom integrations), so
+the preflight suite must be **derived from that specific demo's context**, the same way
+**`artifact--self-sufficiency.mdc`**'s dependency table drives what setup/teardown playbooks a
+demo needs. Walk the demo's actual dependencies and decide which of them deserve a preflight
+check; do not copy a generic template of checks onto a demo that doesn't need them.
+
+Non-exhaustive menu of categories to consider for each demo (pick what applies):
+
+| Category | Example check |
+| --- | --- |
+| Connectivity | Network reachability, DNS resolution, required ports open to targets/APIs |
+| Custom API functional tests | A real (non-destructive) call against a customer/third-party custom API used by the demo, asserting the expected response shape |
+| Credential / auth validation | Controller token still valid, cloud provider credentials authenticate (e.g. STS `GetCallerIdentity`, Azure `az account show` equivalent), vault secrets decrypt |
+| Target host reachability | `ansible.builtin.ping` / `ansible.windows.win_ping` against every inventory group the demo targets |
+| Third-party service health | The specific external system(s) the demo integrates with (ServiceNow, Satellite, a monitoring endpoint, etc.) respond and are reachable |
+
+Add other categories when the demo's dependencies call for them (e.g. EE image availability,
+cloud quota, subscription status) — this table is a starting point, not a ceiling.
+
+## Naming and labeling
+
+- Define the secondary `Preflight` label in `group_vars/all/labels.yml` **alongside** the
+  demo's primary label (see **`artifact--labels.mdc`** — the primary label is mandatory on
+  every labelable object, including preflight):
+
+  ```yaml
+  controller_labels:
+    - name: "{{ demo_label_name }}"
+      organization: "{{ demo_organization_name }}"
+    - name: Preflight
+      organization: "{{ demo_organization_name }}"
+  ```
+
+- Every preflight job template and `WF - Preflight Checks` carries **both** labels:
+
+  ```yaml
+  labels:
+    - "{{ demo_label_name }}"
+    - Preflight
+  ```
+
+  Never ship `labels: [Preflight]` alone — that hides the object when an operator filters
+  the Controller UI by the demo's primary label.
+- Name each check job template **`Preflight - <Check Name>`** (e.g.
+  `Preflight - Controller API Connectivity`, `Preflight - ServiceNow Health`,
+  `Preflight - Cloud Credentials`). The `Preflight` secondary label is what makes the suite
+  filterable across demos; the primary label keeps it visible under this demo's filter.
+- Name the aggregating workflow **`WF - Preflight Checks`** (see Orchestration below).
+
+## Orchestration: standalone templates + an aggregating workflow
+
+Ship **both**:
+
+1. **One job template per check**, each independently launchable from the Controller UI so an
+   operator can re-run a single failing check without re-running the whole suite.
+2. **One aggregating workflow template**, `WF - Preflight Checks`, wiring every preflight job
+   template as a node so the operator can run the entire suite in one launch.
+
+Default to **parallel root nodes** (no edges between checks) unless one check is a genuine
+prerequisite for another — for example, a credential-validation check should run (and succeed)
+**before** a custom API check that depends on that same credential, wired with a success edge.
+Do not invent artificial ordering between unrelated checks.
+
+## Failure policy: fail-fast
+
+- Each preflight playbook must **fail the job** (non-zero exit) when a check does not pass —
+  use `ansible.builtin.assert` (or `ansible.builtin.fail` for cases `assert` can't express)
+  with a clear `fail_msg` describing what's wrong and how to fix it. Do not merely log a warning
+  and exit 0; a preflight check that can't fail is not a gate, just noise.
+- No node in `WF - Preflight Checks` should suppress a failing check's status (e.g. no
+  `ignore_errors` inside the checks themselves). A failed check must surface as a failed node
+  and a failed overall workflow run.
+
+## Read-only guarantee (mandatory)
+
+Preflight playbooks must be **strictly non-destructive**: they gather information and assert
+expectations, never create, update, or delete state anywhere (AAP, target hosts, cloud
+providers, third-party systems). This is what makes it safe to run the whole suite at any time,
+repeatedly, including live during a customer engagement, without side effects or drift.
+
+- Allowed: `ansible.builtin.ping`/`win_ping`, `gather_facts`, `ansible.builtin.uri` with `GET`
+  (or other safe read-only verbs) against APIs, `wait_for` on ports, `assert`, `fail`, `debug`,
+  read-only cloud SDK calls (identity/describe/list/get operations).
+- Disallowed: any task with `state: present|absent`, any create/update/delete API call, any
+  module that provisions, installs, or mutates target/cloud/AAP state.
+- If a check genuinely needs a mutating call to prove something works (rare), it must fully
+  undo the side effect in the same playbook run (create-then-delete) and be flagged clearly in
+  a header comment explaining why a read-only check wasn't sufficient — treat this as the
+  exception, not the default.
+
+## Independent from the main demo workflow
+
+`WF - Preflight Checks` is **not** wired as a prerequisite or approval node inside the demo's
+main workflow (e.g. `WF - Demo`). It stays a separate, standalone workflow the operator launches
+manually, at their discretion, whenever they want to validate the environment — before a demo
+run, after infrastructure changes, or on a schedule they set up themselves. Document this as a
+manual pre-demo step in `docs/procedures.md` (when to run it, what a passing run looks like,
+where to look when a check fails) rather than gating the demo workflow's launch on it.
+
+## Directory layout
+
+```
+playbooks/preflight/
+├── site.yml               # aggregator: imports every check playbook below, in no particular
+│                           # order unless one check is a true prerequisite for another
+├── connectivity.yml        # example — name files after the demo's actual checks, not generically
+├── credentials.yml
+├── host_reachability.yml
+├── custom_api.yml
+└── <third_party_service>.yml
+```
+
+Name the individual playbook files after what they check (matching the job template names),
+not after this generic example list — a demo without a third-party dependency should not ship
+an empty `third_party.yml` placeholder.
+
+## CasC wiring
+
+- `group_vars/all/job_templates.yml`: one entry per check, `playbook: playbooks/preflight/<file>.yml`,
+  `labels: ["{{ demo_label_name }}", Preflight]`, name `Preflight - <Check Name>`.
+- `group_vars/all/workflow_templates.yml`: one entry, name `WF - Preflight Checks`,
+  `labels: ["{{ demo_label_name }}", Preflight]`, nodes referencing each
+  `Preflight - <Check Name>` job template per the Orchestration section above.
+- Any `demo_variables.yml.example` value a preflight playbook reads at runtime (a hostname, an
+  API endpoint, a credential name) must be threaded into that job template's `extra_vars` —
+  same rule as every other job template, see **`artifact--extra-vars-propagation.mdc`**.
+
+## Not a replacement for `verify.yml` or CasC pre-checks
+
+Preflight job templates are distinct from two other assert-based checks already in the standard
+layout: `playbooks/verify.yml` (local idempotency/smoke test run right after a specific
+`aap_config.yml` apply — `artifact--ansible-quality.mdc`) and `aap_config.yml`'s own `pre_tasks`
+variable validation (local, pre-apply — `artifact--casc-playbooks.mdc`). Preflight checks instead
+run **after** CasC is already applied, as standing AAP job templates the operator can launch at
+any time against the live environment. Don't fold one into the other.
+
+## Checklist
+
+- [ ] Preflight checks are derived from this demo's actual dependencies, not copy-pasted from
+      another artifact's fixed list
+- [ ] `Preflight` label defined in `labels.yml` alongside `{{ demo_label_name }}`; every
+      preflight job template and `WF - Preflight Checks` carries **both** labels and follows
+      the `Preflight - <Check Name>` naming convention
+- [ ] Each check has its own standalone job template **and** is wired as a node in
+      `WF - Preflight Checks`
+- [ ] Every check playbook fails (non-zero) on a failed assertion; no `ignore_errors` hides a
+      failing check
+- [ ] Every preflight playbook is strictly read-only (or undoes its own side effect in the
+      rare mutating-check case, with a documented reason)
+- [ ] `WF - Preflight Checks` is **not** referenced as a node inside the main demo workflow
+- [ ] `docs/procedures.md` documents when/how to run the preflight suite and what a passing
+      run looks like
+- [ ] Any `demo_variables.yml.example` value a check reads is threaded into that job template's
+      `extra_vars` per `artifact--extra-vars-propagation.mdc`

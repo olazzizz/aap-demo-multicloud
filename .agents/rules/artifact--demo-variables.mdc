@@ -1,0 +1,201 @@
+---
+description: Naming conventions and structure standards for demo_variables.yml.example in aap-demo-* artifacts
+alwaysApply: true
+---
+
+# demo_variables.yml.example naming conventions
+
+## Section order (mandatory)
+
+1. File header banner
+2. Flags (`demo_no_log`, `aap_configuration_secure_logging`) — every flag defined here that
+   is consumed by a non-CasC-entry playbook must also be threaded into that playbook's job
+   template `extra_vars`, per **`artifact--extra-vars-propagation.mdc`**; defining the flag
+   here alone does not make it reach an AAP-launched job run
+3. **Vault variable mappings** — map every `vault_*` secret to its plain name
+4. AAP connection (`aap_hostname`, `aap_username`, `aap_password`, `aap_validate_certs`,
+   `aap_controller_api_prefix`, optional commented `aap_token`)
+5. Demo identity (`demo_organization_name`, `demo_organization_description`, `demo_project_name`,
+   `demo_label_name`, `demo_inventory_name`, `demo_execution_environment_name`) —
+   `demo_label_name` is the primary AAP UI filter label applied to every labelable object;
+   see **`artifact--labels.mdc`**
+6. Git repository configuration block (see `artifact--git-repository.mdc`)
+7. Cloud provider blocks — one section per provider, alphabetical (AWS → Azure → GCP)
+8. Optional integrations (EDA, SMTP, feature flags)
+9. Credential names
+10. Setup variables (`playbooks/setup/` inputs)
+
+## Variable prefix conventions
+
+| Prefix | Use for |
+|---|---|
+| `demo_` | AAP object names, SCM settings, labels, EE name, setup-level operational vars |
+| `aap_` | AAP/Controller connection and API settings |
+| `azure_` | Azure-specific settings (subscription, tenant, resource group, account names, runbook, schedule) |
+| `aws_` | AWS-specific settings (region, SSM, EC2, IAM, maintenance window) |
+| `gcp_` | GCP-specific settings |
+| `eda_` | EDA Controller connection and rulebook settings |
+| `enable_` | Boolean feature flags (`enable_email_notification`, `enable_aws`, `enable_azure`) |
+| `<service>_credential_name` | AAP credential object names (e.g. `azure_credential_name`, `aws_credential_name`) |
+| Scenario-specific | One prefix per major integration: `proxmox_*`, `f5_*`, `breakglass_*`, `drift_*`, `snapshot_*` |
+
+## Vault mapping section
+
+- Must appear **before** any variable that references a plain name derived from a vault secret.
+- Every `vault_*` variable in `vault.yml.example` must have a corresponding mapping line here.
+- Format: `plain_name: "{{ vault_plain_name }}"` — no additional logic, no `| default()` filters.
+- Do **not** repeat the plain name later in the file with a different value.
+- An **incomplete chain is a bug**: `aap_password: "{{ controller_password }}"` requires that
+  `controller_password: "{{ vault_controller_password }}"` exists above it.
+
+```yaml
+# ============================================================================
+# Vault variable mappings
+# ============================================================================
+# Map vault_ prefixed secrets to the plain names used by roles and playbooks.
+# vault.yml must be copied from vault.yml.example and encrypted before use.
+controller_username: "{{ vault_controller_username }}"
+controller_password: "{{ vault_controller_password }}"
+```
+
+## AAP connection block
+
+Always include `aap_controller_api_prefix` for AAP 2.5+ Platform Gateway deployments.
+
+```yaml
+aap_hostname: CHANGE_ME
+aap_username: "{{ controller_username }}"
+aap_password: "{{ controller_password }}"
+aap_validate_certs: false
+# Controller REST API path prefix when calling through Platform Gateway (AAP 2.5+).
+aap_controller_api_prefix: /api/controller/v2
+```
+
+Add `aap_token` **only** when the demo explicitly uses token-based (PAT) authentication
+instead of username/password. Do **not** add it as a commented-out placeholder if the
+demo does not use it — it adds noise without value.
+
+```yaml
+# Only when the demo uses PAT auth:
+aap_token: "{{ vault_aap_token }}"
+```
+
+## Object names that must be unique across artifacts (mandatory)
+
+Several identity variables are used elsewhere in the standard artifact pattern (cleanup
+deletes, EE credential resolution) in ways that assume the value is not shared with another
+artifact deployed to the same AAP. Reusing a generic placeholder across artifacts is a
+recurring source of cross-demo incidents, not a style nit:
+
+| Variable | Why it must be unique | Failure mode if shared |
+|---|---|---|
+| `demo_organization_name` | `playbooks/aap_cleanup.yml` deletes the Organization by name as its last step; the delete cascades to **every** Project/Inventory/EE/Credential under it | Cleaning up one demo destroys the other demo's AAP objects (see the organization deletion guard in `artifact--casc-playbooks.mdc`, which mitigates but does not replace unique naming) |
+| `demo_inventory_name` | Same Organization collision risk, plus ambiguous inventory lookups in constructed-inventory sync tasks | Wrong inventory targeted or sync task resolves the wrong record |
+| `demo_azure_inventory_name` / `demo_aws_inventory_name` (or any other child inventory variable) | `ansible.controller.host`, `ansible.controller.group`, and `input_inventories` on `ansible.controller.inventory` all resolve their `inventory:` reference by a name-only Controller API lookup with **no organization filter** (`module.resolve_name_to_id`) | `aap_config.yml` fails with `returned 2 items, expected 1` the moment a second artifact creates a same-named child inventory (e.g. bare `Azure-Resources`) in its own Organization |
+| `hub_registry_credential_name` | `ansible.controller.execution_environment`'s `credential:` field resolves via the same kind of name-only Controller API lookup with **no organization filter** (see `artifact--execution-environment.mdc`) | `aap_config.yml` fails with `returned 2 items, expected 1` the moment a second artifact creates a same-named credential in its own Organization |
+| Any other `*_credential_name` (e.g. `azure_credential_name`, `aws_credential_name`, `controller_credential_name`) | `job_template`'s and `workflow_job_template`'s `credentials:` list, and `workflow_job_template_node`'s `credentials:`/`execution_environment:` fields, all resolve names the same unscoped way | Same `returned 2 items, expected 1` failure — an audit found generic placeholders like `Azure Service Principal` and `AAP-Controller-Credential` reused verbatim across otherwise-unrelated artifacts; always suffix with the artifact name/slug |
+
+The common root cause above (`ansible.controller.*` modules resolving a bare-name reference
+field with no organization filter) is not limited to the rows listed — it applies to **any**
+name a CasC object references by string instead of by the object it is defined alongside.
+Treat every AAP object name in `demo_variables.yml.example` and `group_vars/all/*.yml` as
+artifact-unique by default; only object names that are true singletons controller-wide
+(e.g. `credential_type` names for built-in types) are safe to reuse. Run the uniqueness
+`grep` below across **all** `*_name` and `*_credential_name` variables, not just the three
+historically-bitten ones, when auditing or adding an artifact.
+
+Before finalizing a new artifact's `demo_variables.yml.example`:
+
+- Set every AAP object name to a value **derived from the artifact slug or title** — the
+  same convention already used for `demo_project_name` and `demo_execution_environment_name`
+  (e.g. `ee-<slug>`). Do not reuse a generic placeholder like `Multicloud Demo`,
+  `Demo-Multicloud`, bare `PAH Container Registry`, or bare `Azure-Resources`/`AWS-Resources`
+  across artifacts.
+- Verify uniqueness against every sibling artifact before shipping. Check the well-known
+  identity variables plus **every** `*_name`/`*_credential_name` variable, since new
+  variables (child inventories, per-cloud credentials, etc.) are just as exposed:
+
+  ```bash
+  grep -rhoE "^[a-z0-9_]+_(name|credential_name):\s*\"?[^\"#{]+" \
+    artifacts/demos/*/group_vars/all/demo_variables.yml artifacts/demos/*/group_vars/all/demo_variables.yml.example \
+    | sed -E 's/\s+$//' | sort | uniq -d
+  ```
+
+  Any `key: value` line printed by that pipeline is reused verbatim across two or more
+  artifacts and must be disambiguated. For a quick manual check of just the
+  historically-bitten variables:
+
+  ```bash
+  grep -rn "demo_organization_name:\|demo_inventory_name:\|demo_azure_inventory_name:\|demo_aws_inventory_name:\|hub_registry_credential_name:" \
+    artifacts/demos/*/group_vars/all/demo_variables.yml.example
+  ```
+
+  If any value matches an existing artifact's value, rename the new artifact's value —
+  never the existing one, unless the two artifacts are an intentional multi-artifact split
+  of the same engagement that is meant to share one Organization (rare; document this
+  explicitly in both READMEs if so — and note that `hub_registry_credential_name` and any
+  child inventory name must stay unique even then, since these name-resolution bugs are not
+  related to Organization sharing).
+
+## EDA connection block (when EDA is in scope)
+
+```yaml
+eda_hostname: CHANGE_ME
+eda_username: "{{ eda_controller_username }}"
+eda_password: "{{ eda_controller_password }}"
+eda_validate_certs: false
+eda_rulebook_name: CHANGE_ME
+```
+
+Map `eda_controller_username`/`eda_controller_password` from vault in the mapping section.
+
+## Feature flags and optional cloud slices
+
+Use `enable_<feature>` boolean flags for optional integrations or cloud provider slices:
+
+```yaml
+enable_email_notification: false
+enable_aws: true
+enable_azure: true
+```
+
+## Hub / custom EE variables (when a custom execution environment is in scope)
+
+Owned by **`artifact--execution-environment.mdc`** — define these three variables there, not
+here, and do not restate them with different values. Placed in the **demo identity** section (5),
+immediately after `demo_execution_environment_name`:
+
+```yaml
+demo_execution_environment_image: CHANGE_ME/ee-<slug>:latest
+hub_registry_credential_name: PAH Container Registry
+hub_registry_host: "{{ aap_hostname | regex_replace('^https?://', '') | regex_replace('/$', '') }}"
+```
+
+## RBAC-heavy scenarios
+
+Add `demo_team_name` when the demo creates teams or RBAC objects in AAP:
+
+```yaml
+demo_team_name: CHANGE_ME
+```
+
+## Placeholder conventions
+
+| Situation | Value |
+|---|---|
+| Operator must supply a unique value | `CHANGE_ME` |
+| Operator must supply a unique value (semantic context helpful) | `CHANGE_ME_<SUFFIX>` (e.g. `CHANGE_ME_ROLE_ARN`) |
+| SCM URL | `CHANGE_ME_GIT_REPO_URL` |
+| Value populated by a setup playbook output | `CHANGE_ME` with a comment naming the playbook |
+| Sensible default that can be kept as-is | Actual default value (e.g. `us-east-1`, `main`) |
+
+Use semantic `CHANGE_ME_*` suffixes when multiple CHANGE_ME values in the same block
+would be ambiguous (e.g. `CHANGE_ME_ACCOUNT_ID` vs `CHANGE_ME_ROLE_ARN`).
+
+## What does NOT belong here
+
+- Raw secrets — use `vault.yml.example` for passwords, keys, tokens.
+- Duplicate definitions of the same variable (second definition silently wins in YAML).
+- Computed URLs via Jinja conditionals — see `artifact--git-repository.mdc`.
+- Non-secret IDs (subscription ID, tenant ID, resource group) are **not** secrets and must
+  live here, not in `vault.yml.example`.

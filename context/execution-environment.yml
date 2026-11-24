@@ -1,0 +1,51 @@
+---
+# Build a custom EE when the platform default lacks Azure/AWS SDK dependencies.
+# See docs/setup.md for ansible-builder instructions.
+#
+# ee-supported-rhel9 installs Ansible and its dependencies for Python 3.12.
+# $PYCMD defaults to /usr/bin/python3 (Python 3.9) in the builder stages, so
+# ENV PYCMD=/usr/bin/python3.12 is set in prepend_builder and prepend_final.
+#
+# In EE spec v3, the assemble script (pip install of collection Python deps)
+# runs in the BUILDER stage, not the final stage. gcc and all C headers must
+# therefore be in prepend_builder, not prepend_final.
+version: 3
+
+build_arg_defaults:
+  ANSIBLE_GALAXY_CLI_COLLECTION_OPTS: "-v"
+
+images:
+  base_image:
+    name: registry.redhat.io/ansible-automation-platform-27/ee-supported-rhel9:latest
+
+# Both ee-minimal-rhel9 and ee-supported-rhel9 use microdnf, not dnf.
+# Without this override the assemble script calls /usr/bin/dnf and fails.
+options:
+  package_manager_path: /usr/bin/microdnf
+
+dependencies:
+  galaxy: requirements.yml
+
+# Project-root ansible.cfg (Automation Hub token) is required before build.
+additional_build_files:
+  - src: ../ansible.cfg
+    dest: configs
+
+additional_build_steps:
+  prepend_galaxy:
+    # Use the same Hub server_list and token as local collection installs.
+    - COPY _build/configs/ansible.cfg /etc/ansible/ansible.cfg
+  prepend_builder:
+    # Override $PYCMD to python3.12: pyyaml, packaging, and Ansible are
+    # installed for Python 3.12 in ee-supported-rhel9. assemble (pip install
+    # of collection Python deps) also runs in this stage, so gcc and all C
+    # headers must be present here — not in prepend_final.
+    - ENV PYCMD=/usr/bin/python3.12
+    - RUN microdnf install -y gcc krb5-devel systemd-devel dbus-devel glib2-devel python3.12-devel && microdnf clean all
+  prepend_final:
+    # Override $PYCMD so check_ansible targets Python 3.12. No assemble runs
+    # in this stage; only check_ansible and dumb-init install.
+    - ENV PYCMD=/usr/bin/python3.12
+  append_final:
+    # Do not ship ansible.cfg in the final image (may contain tokens).
+    - RUN rm -f /etc/ansible/ansible.cfg

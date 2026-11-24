@@ -1,0 +1,21 @@
+---
+# Multicloud inventory hierarchy: two source inventories (Azure, AWS) feed
+# into a single constructed inventory (Demo-MulticloudSnapshots).
+# The source inventories must be defined first so they exist when the
+# constructed inventory references them via input_inventories.
+controller_inventories:
+  - name: "{{ demo_azure_inventory_name }}"
+    organization: "{{ demo_organization_name }}"
+    description: Azure VMs and resources for snapshot workflows
+
+  - name: "{{ demo_aws_inventory_name }}"
+    organization: "{{ demo_organization_name }}"
+    description: AWS EC2 instances and resources for snapshot workflows
+
+  - name: "{{ demo_inventory_name }}"
+    organization: "{{ demo_organization_name }}"
+    description: Constructed inventory aggregating Azure and AWS resources
+    kind: constructed
+    input_inventories:
+      - "{{ demo_azure_inventory_name }}"
+      - "{{ demo_aws_inventory_name }}"

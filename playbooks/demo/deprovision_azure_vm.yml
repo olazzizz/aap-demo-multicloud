@@ -1,0 +1,159 @@
+# Description: Destroy the Azure demo VM and all associated networking resources.
+# Removes resources in reverse dependency order: VM -> NIC -> public IP -> NSG ->
+# subnet -> VNet. The resource group is optionally deleted if
+# azure_delete_resource_group=true (defaults to false to protect shared groups).
+# Counterpart: provision_azure_vm.yml (creates everything torn down here).
+# Authenticates via the Service Principal credentials AAP injects (default) or,
+# when azure_auth_mode: msi, via Managed Identity — see the auth_source
+# parameter on each azure_rm_* task below and docs/setup.md.
+---
+- name: Deprovision Azure demo VM and networking resources
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - azure.azcollection
+    - ansible.builtin
+
+  pre_tasks:
+    - name: Validate required Azure deprovisioning variables
+      ansible.builtin.assert:
+        that:
+          - azure_vm_hostname is defined
+          - azure_resource_group is defined
+        fail_msg: >-
+          Set azure_vm_hostname and azure_resource_group in demo_variables.yml
+          or job template extra variables before deprovisioning.
+      tags:
+        - always
+
+    - name: Resolve Azure deprovisioning variables with defaults
+      ansible.builtin.set_fact:
+        target_hostname: "{{ azure_vm_hostname }}"
+        azure_vnet_name: "{{ azure_vnet_name | default('demo-multicloud-vnet') }}"
+        azure_subnet_name: "{{ azure_subnet_name | default('demo-multicloud-subnet') }}"
+        azure_nsg_name: "{{ azure_nsg_name | default('demo-multicloud-nsg') }}"
+        azure_public_ip_name: "{{ azure_public_ip_name | default(azure_vm_hostname + '-pip') }}"
+        azure_nic_name: "{{ azure_nic_name | default(azure_vm_hostname + '-nic') }}"
+        azure_delete_resource_group: "{{ azure_delete_resource_group | default(false) | bool }}"
+      tags:
+        - always
+
+  tasks:
+    # AAP's Azure RM credential type has no Managed Identity input, so it can
+    # only inject Service Principal env vars (AZURE_CLIENT_ID/SECRET/TENANT).
+    # To support Managed Identity too, every azure_rm_* task below passes
+    # auth_source explicitly: "msi" when azure_auth_mode: msi (the host running
+    # this job must then be an Azure resource with MSI enabled — see
+    # docs/setup.md), otherwise omitted so the module falls back to its
+    # default "auto" source (module params -> env -> credential_file -> cli),
+    # which picks up the Service Principal env vars AAP already injected.
+    #
+    # VM must be removed before its NIC and disks can be released.
+    - name: Delete the Azure demo VM and its managed OS disk
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ target_hostname }}"
+        remove_on_absent:
+          - all_autocreated
+        state: absent
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      tags:
+        - azure
+        - deprovision
+        - vm
+
+    # Explicit disk removal guards against the ConflictingUserInput error on
+    # re-provisioning. The azure_rm_virtualmachine remove_on_absent behaviour
+    # varies by collection version and disk naming; deleting the disk by name
+    # ensures no orphan remains even if the VM deletion did not clean it up.
+    - name: Remove the managed OS disk left by the VM (guard against orphaned disk)
+      azure.azcollection.azure_rm_manageddisk:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ target_hostname }}"
+        state: absent
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      ignore_errors: true
+      tags:
+        - azure
+        - deprovision
+        - vm
+
+    - name: Delete the network interface
+      azure.azcollection.azure_rm_networkinterface:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_nic_name }}"
+        state: absent
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      tags:
+        - azure
+        - deprovision
+        - network
+
+    - name: Delete the public IP address
+      azure.azcollection.azure_rm_publicipaddress:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_public_ip_name }}"
+        state: absent
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      tags:
+        - azure
+        - deprovision
+        - network
+
+    - name: Delete the network security group
+      azure.azcollection.azure_rm_securitygroup:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_nsg_name }}"
+        state: absent
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      tags:
+        - azure
+        - deprovision
+        - network
+
+    - name: Delete the demo subnet
+      azure.azcollection.azure_rm_subnet:
+        resource_group: "{{ azure_resource_group }}"
+        virtual_network_name: "{{ azure_vnet_name }}"
+        name: "{{ azure_subnet_name }}"
+        state: absent
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      tags:
+        - azure
+        - deprovision
+        - network
+
+    - name: Delete the demo virtual network
+      azure.azcollection.azure_rm_virtualnetwork:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_vnet_name }}"
+        state: absent
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      tags:
+        - azure
+        - deprovision
+        - network
+
+    # Deleting the resource group removes everything inside it. Only enabled
+    # when the group was created exclusively for this demo.
+    - name: Delete the resource group (when explicitly requested)
+      azure.azcollection.azure_rm_resourcegroup:
+        name: "{{ azure_resource_group }}"
+        state: absent
+        force_delete_nonempty: true
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      when: azure_delete_resource_group | bool
+      tags:
+        - azure
+        - deprovision
+        - network
+
+    - name: Display Azure deprovision summary
+      ansible.builtin.debug:
+        msg: >-
+          Azure VM '{{ target_hostname }}' and associated networking resources
+          removed from resource group '{{ azure_resource_group }}'.
+          {{ 'Resource group also deleted.' if (azure_delete_resource_group | bool) else 'Resource group preserved.' }}
+      tags:
+        - azure
+        - deprovision

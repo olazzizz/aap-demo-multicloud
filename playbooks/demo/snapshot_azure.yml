@@ -1,0 +1,137 @@
+# Description: Discover an Azure VM by hostname and snapshot all managed disks.
+# Authenticates via the Service Principal credentials AAP injects (default) or,
+# when azure_auth_mode: msi, via Managed Identity — see the auth_source
+# parameter on each azure_rm_* task below and docs/setup.md.
+---
+- name: Create Azure disk snapshots for a VM identified by hostname
+  hosts: localhost
+  gather_facts: true
+  collections:
+    - azure.azcollection
+    - ansible.builtin
+
+  pre_tasks:
+    - name: Validate required Azure snapshot variables
+      ansible.builtin.assert:
+        that:
+          - target_hostname is defined
+          - azure_resource_group is defined
+        fail_msg: >-
+          Pass target_hostname and azure_resource_group when running Azure snapshot jobs.
+      tags:
+        - always
+
+    - name: Resolve Azure snapshot variables with defaults
+      ansible.builtin.set_fact:
+        snapshot_name_prefix: "{{ snapshot_name_prefix | default('poc-snapshot') }}"
+      tags:
+        - always
+
+  tasks:
+    # AAP's Azure RM credential type has no Managed Identity input, so it can
+    # only inject Service Principal env vars (AZURE_CLIENT_ID/SECRET/TENANT).
+    # To support Managed Identity too, every azure_rm_* task below passes
+    # auth_source explicitly: "msi" when azure_auth_mode: msi (the host running
+    # this job must then be an Azure resource with MSI enabled — see
+    # docs/setup.md), otherwise omitted so the module falls back to its
+    # default "auto" source (module params -> env -> credential_file -> cli),
+    # which picks up the Service Principal env vars AAP already injected.
+    - name: Look up Azure virtual machine by hostname
+      azure.azcollection.azure_rm_virtualmachine_info:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ target_hostname }}"
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      register: azure_vm_info
+      tags:
+        - azure
+        - discover
+
+    - name: Ensure exactly one VM matches the hostname
+      ansible.builtin.assert:
+        that:
+          - azure_vm_info.vms | length == 1
+        fail_msg: >-
+          Expected one VM named {{ target_hostname }} in {{ azure_resource_group }},
+          found {{ azure_vm_info.vms | length }}.
+      tags:
+        - azure
+        - discover
+
+    # azure_rm_virtualmachine_info does not expose storage_profile in all versions
+    # of azure.azcollection. Use azure_rm_resource_info to retrieve the raw Azure
+    # REST API response, which consistently includes properties.storageProfile.
+    - name: Get full Azure VM resource to extract managed disk IDs
+      azure.azcollection.azure_rm_resource_info:
+        resource_group: "{{ azure_resource_group }}"
+        provider: Compute
+        resource_type: virtualMachines
+        resource_name: "{{ target_hostname }}"
+        api_version: "2023-07-01"
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      register: azure_vm_resource
+      tags:
+        - azure
+        - discover
+
+    # The raw REST API response uses camelCase: storageProfile, osDisk, managedDisk.
+    # Combine the OS disk ID with any data disk IDs into a single list for snapshotting.
+    - name: Build list of managed disk resource IDs attached to the VM
+      ansible.builtin.set_fact:
+        azure_disk_ids: >-
+          {{
+            [azure_vm_resource.response[0].properties.storageProfile.osDisk.managedDisk.id]
+            + (azure_vm_resource.response[0].properties.storageProfile.dataDisks | default([])
+               | map(attribute='managedDisk.id') | list)
+          }}
+      tags:
+        - azure
+        - discover
+
+    # Azure snapshot resource names are capped at 80 characters. The managed
+    # disk's own name (item | basename) already carries Azure's auto-generated
+    # <vmname>_OsDisk_1_<32-char-guid> (or _DataDisk_N_<guid>) suffix, so folding
+    # it into the snapshot name — on top of the prefix, hostname, and date/time
+    # suffix — routinely exceeds the limit and Azure rejects the request with
+    # "InvalidParameter: The value of parameter snapshot.name is invalid" (400).
+    # Use a short, deterministic role label instead (osdisk for index 0,
+    # datadiskN for the rest), since azure_disk_ids always lists the OS disk
+    # first followed by data disks in order.
+    - name: Create a snapshot for each managed disk
+      azure.azcollection.azure_rm_snapshot:
+        resource_group: "{{ azure_resource_group }}"
+        # Include both date and hour-minute so multiple runs on the same day each
+        # produce a distinct named snapshot, consistent with AWS behaviour.
+        name: >-
+          {{ snapshot_name_prefix }}-{{ target_hostname }}-{{ 'osdisk' if disk_index == 0 else 'datadisk' + (disk_index | string) }}-{{ ansible_date_time.date | regex_replace('-', '') }}-{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}
+        location: "{{ azure_vm_info.vms[0].location }}"
+        creation_data:
+          create_option: Copy
+          source_id: "{{ item }}"
+        tags:
+          Demo: multicloud-snapshots
+          SourceHostname: "{{ target_hostname }}"
+          RetentionDays: "{{ snapshot_retention_days | default(30) | string }}"
+        auth_source: "{{ 'msi' if (azure_auth_mode | default('service_principal') == 'msi') else omit }}"
+      loop: "{{ azure_disk_ids }}"
+      loop_control:
+        index_var: disk_index
+      register: azure_snapshot_results
+      tags:
+        - azure
+        - snapshot
+
+    - name: Publish Azure snapshot results for downstream workflow nodes
+      ansible.builtin.set_stats:
+        data:
+          azure_snapshots_created: "{{ azure_snapshot_results.results | map(attribute='id') | list }}"
+          azure_snapshot_hostname: "{{ target_hostname }}"
+      tags:
+        - azure
+        - snapshot
+
+    - name: Display created Azure snapshot names
+      ansible.builtin.debug:
+        msg: "Created {{ azure_snapshot_results.results | length }} Azure snapshot(s) for {{ target_hostname }}."
+      tags:
+        - azure
+        - snapshot

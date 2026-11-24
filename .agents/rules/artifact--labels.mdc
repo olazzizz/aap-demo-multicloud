@@ -1,0 +1,86 @@
+---
+description: Primary demo label plus optional secondary labels on every labelable AAP CasC object. Part of the artifact--* rule set.
+alwaysApply: true
+---
+
+# AAP labels: one primary demo label on every object
+
+Every `aap-demo-*` artifact must expose a **single primary label** that uniquely identifies
+the demo in the Controller UI, so an operator can filter Job Templates, Workflows, and any
+other labelable object down to *this* demo alone — even when dozens of demos share the same
+AAP. Secondary labels (e.g. `Preflight`, `Patching`, `Cleanup`) are encouraged for
+cross-cutting filters, but they **never replace** the primary label.
+
+## Primary label
+
+1. Define **`demo_label_name`** in `demo_variables.yml.example` (demo identity section —
+   see **`artifact--demo-variables.mdc`**). Derive the value from the artifact title or slug
+   (e.g. `PoC App Stack Restart`, `Slack Notifications`). It must be **unique across every
+   sibling artifact** deployed to the same AAP — the same uniqueness bar as
+   `demo_organization_name`.
+2. Declare it in `group_vars/all/labels.yml` under `controller_labels`, scoped to the demo
+   organization:
+
+   ```yaml
+   controller_labels:
+     - name: "{{ demo_label_name }}"
+       organization: "{{ demo_organization_name }}"
+   ```
+
+3. Apply it to **every** CasC object that accepts a `labels:` field. At minimum this means
+   every job template and every workflow job template (including infra-gated
+   `*_infra.yml` counterparts and the preflight suite). Also apply it to inventories and
+   projects when those CasC files set `labels:`.
+
+## Secondary labels
+
+Objects may carry additional labels alongside the primary one:
+
+```yaml
+labels:
+  - "{{ demo_label_name }}"
+  - Preflight
+```
+
+- Declare every secondary label in `labels.yml` as well (same organization).
+- Common secondary labels: `Preflight` (see **`artifact--preflight-checks.mdc`**),
+  functional tags such as `Patching`, `Provisioning`, `Cleanup`.
+- A secondary label alone is **not** enough. Filtering the UI by `demo_label_name` must still
+  return the object.
+
+## Anti-patterns (do not ship)
+
+```yaml
+# WRONG — preflight-only; disappears when filtering by the demo's primary label
+labels:
+  - Preflight
+
+# WRONG — hardcoded string instead of the shared identity variable
+labels:
+  - PoC App Stack Restart
+
+# CORRECT
+labels:
+  - "{{ demo_label_name }}"
+  - Preflight
+```
+
+## Scope notes
+
+- Labels apply to Controller objects that support them via CasC (`controller_templates`,
+  `controller_workflows`, and optionally `controller_inventories` / `controller_projects`).
+  Credentials, credential types, execution environments, and organizations do not take
+  `labels:` — do not invent a field there.
+- Labels are removed with the Organization on cleanup (no direct delete API) — see
+  **`artifact--casc-playbooks.mdc`**.
+
+## Checklist
+
+- [ ] `demo_label_name` is set to a unique, human-readable demo title in
+      `demo_variables.yml.example`
+- [ ] `labels.yml` declares `{{ demo_label_name }}` (and every secondary label used)
+- [ ] Every job template and workflow job template lists `"{{ demo_label_name }}"` first in
+      `labels:`
+- [ ] Preflight job templates and `WF - Preflight Checks` carry both
+      `"{{ demo_label_name }}"` and `Preflight` — never `Preflight` alone
+- [ ] No CasC object that supports labels ships without the primary demo label

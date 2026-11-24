@@ -1,0 +1,60 @@
+---
+# Connect RHEL hosts to Red Hat Lightspeed and upload data.
+# Variables (set via the job template survey or extra vars):
+#   lightspeed_activation_key  - activation key name (console.redhat.com)
+#   lightspeed_org_id          - numeric organization ID
+#   lightspeed_disable_content - true for PAYG/RHUI images (default: true)
+#   target_hosts               - host/group to run on (default: aws_vms)
+
+- name: Connect hosts to Red Hat Lightspeed and upload data
+  hosts: "{{ target_hosts | default('aws_vms') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    lightspeed_disable_content: true
+
+  tasks:
+    - name: Check required variables
+      ansible.builtin.assert:
+        that:
+          - lightspeed_activation_key | default('') | length > 0
+          - lightspeed_org_id | default('') | string | length > 0
+        fail_msg: "Set lightspeed_activation_key and lightspeed_org_id"
+
+    - name: Install rhc, insights-client and rhc-worker-playbook
+      ansible.builtin.dnf:
+        name:
+          - rhc
+          - insights-client
+          - rhc-worker-playbook
+        state: present
+
+    - name: Check whether the host is already registered
+      ansible.builtin.command: subscription-manager identity
+      register: _identity
+      changed_when: false
+      failed_when: false
+
+    - name: Connect the host with rhc
+      ansible.builtin.command: >-
+        rhc connect
+        --activation-key={{ lightspeed_activation_key }}
+        --organization={{ lightspeed_org_id }}
+        {{ '--disable-feature content' if lightspeed_disable_content | bool else '' }}
+      when: _identity.rc != 0
+      no_log: true
+
+    - name: Upload Lightspeed data
+      ansible.builtin.command: insights-client
+      register: _upload
+      changed_when: "'Successfully uploaded' in _upload.stdout"
+
+    - name: Show connection status
+      ansible.builtin.command: rhc status
+      register: _status
+      changed_when: false
+
+    - name: Print status
+      ansible.builtin.debug:
+        var: _status.stdout_lines
